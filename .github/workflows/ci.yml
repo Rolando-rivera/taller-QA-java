@@ -1,33 +1,55 @@
 name: Taller QA
-
 on:
   push:
   pull_request:
-
+  workflow_dispatch:
+    inputs:
+      simular_alerta:
+        description: "Forzar falla del umbral p95"
+        type: boolean
+        default: false
 permissions:
   contents: read
-
 jobs:
   pruebas:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Descargar el código
-        uses: actions/checkout@v4
-
-      - name: Configurar Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: maven
-
       - name: Compilar y ejecutar pruebas
         run: mvn -B clean verify
-
+      - name: Ejecutar rendimiento
+        env:
+          SIMULAR_ALERTA: ${{ inputs.simular_alerta && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          java -cp target/classes cl.taller.CalculadoraServidor > target/servidor.log 2>&1 &
+          servidor_pid=$!
+          trap 'kill "$servidor_pid" 2>/dev/null || true' EXIT
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/suma
+          docker run --rm --network host \
+            -e SIMULAR_ALERTA \
+            -v "$PWD/performance:/scripts:ro" \
+            grafana/k6:0.57.0 run /scripts/suma.js \
+            2>&1 | tee target/k6.txt
+      - name: Publicar dashboard
+        if: always()
+        run: python3 scripts/resumen.py
+      - name: Registrar alerta de calidad
+        if: failure()
+        run: |
+          echo "::error title=Control de calidad fallido::Revisa el primer paso fallido y sus reportes."
       - name: Publicar reportes
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: reportes-pruebas
-          path: target/surefire-reports/
+          path: |
+            target/surefire-reports/
+            target/cucumber.html
+            target/k6.txt
+            target/servidor.log
